@@ -2,6 +2,7 @@ import kotlinx.atomicfu.AtomicRef
 import kotlinx.atomicfu.atomic
 import kotlinx.cinterop.StableRef
 import kotlin.native.concurrent.*
+import kotlin.native.internal.GC
 
 class DetachedMutableMap<K : Any, V : Any> : MutableMap<K, V> {
     // Underlying map is kept in a detached graph, but keys and values are kept indirectly.
@@ -34,10 +35,9 @@ class DetachedMutableMap<K : Any, V : Any> : MutableMap<K, V> {
 
     override fun containsValue(value: V): Boolean {
         return realMap.unsafeAccess { map ->
-            // withWrapper(value) { wValue ->
-            //     map.containsValue(wValue)
-            // }
-            map.values.any { it.get() == value }
+            withWrapper(value) { wValue ->
+                map.containsValue(wValue)
+            }
         }
     }
 
@@ -85,42 +85,65 @@ class DetachedMutableMap<K : Any, V : Any> : MutableMap<K, V> {
 
                 // FIXME: Old xor new key is leaked here.
                 val valueWrapper = map.put(wKey, wValue)
-                valueWrapper?.consume()
+                valueWrapper?.dispose()
             }
         }
     }
 
-    override val entries: MutableSet<MutableMap.MutableEntry<K, V>> get() {
-        // TODO("This complicates locking.")
-        return realMap.unsafeAccess { map ->
-            map.entries.mapTo(LinkedHashSet(map.size)) { entry ->
-                Entry(entry.key.get(), entry.value.get())
+    override val entries: MutableSet<MutableMap.MutableEntry<K, V>> // TODO("This complicates locking.")
+        get() {
+            fun copyEntries(map: MutableMap<Wrapper<K>, Wrapper<V>>): MutableSet<MutableMap.MutableEntry<K, V>> {
+                val entriesSet = LinkedHashSet<MutableMap.MutableEntry<K, V>>(map.size)
+                map.entries.mapTo(entriesSet) { Entry(it.key.get(), it.value.get()) }
+                return entriesSet
+            }
+
+            return realMap.unsafeAccess { map ->
+                val entriesSet = copyEntries(map)
+                GC.collect() // Collect iterators
+                entriesSet
             }
         }
-    }
-    override val keys: MutableSet<K>
+    override val keys: MutableSet<K> // TODO("This complicates locking.")
         get() {
-            // TODO("This complicates locking.")
+            fun copyKeys(map: MutableMap<Wrapper<K>, Wrapper<V>>): MutableSet<K> {
+                val keySet = LinkedHashSet<K>(map.size)
+                map.keys.mapTo(keySet) { it.get() }
+                return keySet
+            }
             return realMap.unsafeAccess { map ->
-                map.keys.mapTo(LinkedHashSet(map.size)) { it.get() }
+                val keySet = copyKeys(map)
+                GC.collect() // To collect iterator `map.keys`.
+                keySet
             }
         }
-    override val values: MutableCollection<V>
+    override val values: MutableCollection<V> // TODO("This complicates locking.")
         get() {
-            // TODO("This complicates locking.")
+            fun copyValues(map: MutableMap<Wrapper<K>, Wrapper<V>>): MutableCollection<V> {
+                val valuesList = ArrayList<V>(map.size)
+                map.values.mapTo(valuesList) { it.get() }
+                return valuesList
+            }
             return realMap.unsafeAccess { map ->
-                map.values.mapTo(ArrayList(map.size)) { it.get() }
+                val valuesList = copyValues(map)
+                GC.collect() // To collect iterator `map.values`.
+                valuesList
             }
         }
 
     override fun clear() {
-        realMap.unsafeAccess { map ->
+        fun clear(map: MutableMap<Wrapper<K>, Wrapper<V>>) {
             // Release StableRef to entries.
-            map.keys.forEach { it.dispose() }
-            map.values.forEach { it.dispose() }
-
+            for ((key, value) in map.entries) {
+                key.dispose()
+                value.dispose()
+            }
             // Actually clear map.
             map.clear()
+        }
+        realMap.unsafeAccess { map ->
+            clear(map)
+            GC.collect() // Collect iterators
         }
     }
 
@@ -129,8 +152,9 @@ class DetachedMutableMap<K : Any, V : Any> : MutableMap<K, V> {
         private val ref: StableRef<T>
 
         init {
-            check(obj.isFrozen)
+            obj.freeze()
             ref = StableRef.create(obj)
+            freeze()
         }
 
         fun get(): T = ref.get()
